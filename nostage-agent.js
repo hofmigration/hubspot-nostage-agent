@@ -134,6 +134,53 @@ function gmailTransport() {
   return mailer;
 }
 
+// Checks the chosen transport works BEFORE the run does any real work, so a
+// missing secret is obvious immediately instead of silently sending nothing.
+async function checkTransport() {
+  if (CFG.SEND_VIA === "gmail") {
+    if (!process.env.GMAIL_APP_PASSWORD) {
+      console.log(`\n!! CANNOT SEND EMAIL — sender is set to Gmail but the GMAIL_APP_PASSWORD secret is missing.`);
+      console.log(`   Fix one of these:`);
+      console.log(`     a) Add the secret: Google Account > Security > 2-Step Verification > App passwords,`);
+      console.log(`        create one, remove the spaces, then add it as repo secret GMAIL_APP_PASSWORD.`);
+      console.log(`     b) Or re-run and pick "Resend - onboarding@resend.dev" in the "How to send" dropdown.`);
+      return { ok: false, reason: "missing GMAIL_APP_PASSWORD" };
+    }
+    try {
+      await gmailTransport().verify();
+      console.log(`Transport: Gmail OK (authenticated as ${CFG.GMAIL_USER})`);
+      return { ok: true };
+    } catch (e) {
+      console.log(`\n!! GMAIL LOGIN FAILED: ${e.message}`);
+      console.log(`   Usually means the app password is wrong, has spaces in it, or app passwords`);
+      console.log(`   are blocked for the Workspace account.`);
+      return { ok: false, reason: `gmail auth failed: ${e.message}` };
+    }
+  }
+  if (!RESEND_KEY) {
+    console.log(`\n!! CANNOT SEND EMAIL — sender is set to Resend but the RESEND_KEY secret is missing.`);
+    return { ok: false, reason: "missing RESEND_KEY" };
+  }
+  console.log(`Transport: Resend OK (as ${CFG.FROM_EMAIL})`);
+  if (CFG.FROM_EMAIL.endsWith("resend.dev"))
+    console.log(`  note: this sender only reaches ${CFG.ALI_EMAIL}. Consultant emails will fail with 403.`);
+  return { ok: true };
+}
+
+// Last-resort path so Ali's report still arrives when the chosen transport is dead.
+async function sendViaResendDirect(to, subject, html) {
+  if (!RESEND_KEY) return false;
+  try {
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${RESEND_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ from: "onboarding@resend.dev", to: [to], subject, html }),
+    });
+    if (!res.ok) { console.log(`  ! fallback email failed: ${res.status} ${(await res.text()).slice(0, 150)}`); return false; }
+    return true;
+  } catch (e) { console.log(`  ! fallback email failed: ${e.message}`); return false; }
+}
+
 async function sendEmail(to, subject, html, attachFile) {
   try {
     if (CFG.SEND_VIA === "gmail") {
@@ -205,6 +252,9 @@ function consultantEmailHtml(firstName, leads, windowLabel) {
     console.log(`!! Sender is onboarding@resend.dev — consultants will NOT receive anything (403). Use Gmail instead.`);
   console.log("");
 
+  const transport = await checkTransport();
+  console.log("");
+
   const ownerMap = await owners();
   const contacts = await fetchUnstaged();
   console.log(`Contacts with NO lead stage and a known owner in this window: ${contacts.length}`);
@@ -271,6 +321,10 @@ function consultantEmailHtml(firstName, leads, windowLabel) {
     console.log(`\nDRY RUN: no consultant emails sent. They WOULD have gone to:`);
     for (const g of groups) console.log(`   ${g.email ? g.email : "NO EMAIL IN HUBSPOT"}  (${g.name}, ${Math.min(g.leads.length, CFG.MAX_PER_CONSULTANT)} leads)`);
     noEmail = groups.filter((g) => !g.email).length;
+  } else if (!transport.ok) {
+    console.log(`\nSKIPPING consultant emails — email is not working (${transport.reason}).`);
+    skipped = groups.length;
+    noEmail = groups.filter((g) => !g.email).length;
   } else {
     console.log(`\nSending consultant emails...`);
     for (const g of groups) {
@@ -307,12 +361,18 @@ function consultantEmailHtml(firstName, leads, windowLabel) {
       T.footer(`Generated ${new Date().toISOString().slice(0, 10)}.`),
   });
 
-  const okReport = await sendEmail(
-    CFG.ALI_EMAIL,
-    `${CFG.DRY_RUN ? "[PREVIEW] " : ""}No lead stage report — ${contacts.length} leads, ${groups.length} consultants`,
-    reportHtml,
-    CFG.OUT_FILE
-  );
-  console.log(`\nReport email to ${CFG.ALI_EMAIL}: ${okReport ? "SENT (with spreadsheet attached)" : "FAILED — see the error above"}`);
+  const reportSubject = `${CFG.DRY_RUN ? "[PREVIEW] " : ""}No lead stage report — ${contacts.length} leads, ${groups.length} consultants`;
+
+  let okReport = false, how = "";
+  if (transport.ok) {
+    okReport = await sendEmail(CFG.ALI_EMAIL, reportSubject, reportHtml, CFG.OUT_FILE);
+    how = okReport ? `via ${CFG.SEND_VIA} (spreadsheet attached)` : "";
+  }
+  if (!okReport) {
+    console.log(`Trying the fallback route for your report...`);
+    okReport = await sendViaResendDirect(CFG.ALI_EMAIL, reportSubject, reportHtml);
+    if (okReport) how = "via Resend fallback (no attachment — get the spreadsheet from Artifacts below)";
+  }
+  console.log(`\nReport email to ${CFG.ALI_EMAIL}: ${okReport ? `SENT ${how}` : "FAILED — no working email route. See the errors above."}`);
   if (!CFG.DRY_RUN) console.log(`Consultant emails sent: ${sent}, skipped: ${skipped}.`);
 })().catch((e) => { console.error("FATAL:", e); process.exit(1); });
