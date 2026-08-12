@@ -167,6 +167,9 @@ function consultantEmailHtml(firstName, leads) {
     </tr>`).join("");
   return `
   <div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#33475b;">
+    <p style="background:#f5f8fa;border-left:3px solid #7c98b6;padding:8px 12px;margin:0 0 16px 0;font-size:13px;color:#516f90;">
+      This is an automated compliance email. Please do not reply to this message. For any question, contact Ali Raza directly.
+    </p>
     <p>Hi ${firstName},</p>
     <p>Hope you are well. The leads below are assigned to you and still have <strong>no lead stage</strong> selected.</p>
     <p>Kindly contact these clients and select the correct lead stage on each record.</p>
@@ -180,7 +183,8 @@ function consultantEmailHtml(firstName, leads) {
     </table>
     <p style="margin-top:16px;">Total: <strong>${leads.length}</strong> leads.</p>
     <p>Thank you.</p>
-    <p style="color:#7c98b6;font-size:12px;">Ali Raza &middot; Compliance &middot; HOF Migration</p>
+    <p style="color:#7c98b6;font-size:12px;margin-bottom:2px;">Ali Raza &middot; Compliance &middot; HOF Migration</p>
+    <p style="color:#a0b4c6;font-size:11px;margin-top:0;">Sent automatically by the CRM compliance system. Generated ${new Date().toISOString().slice(0, 10)}.</p>
   </div>`;
 }
 
@@ -267,7 +271,7 @@ function consultantEmailHtml(firstName, leads) {
     const leads = g.leads.slice(0, CFG.MAX_PER_CONSULTANT);
     const ok = await sendEmail(
       g.email,
-      `${leads.length} of your leads have no lead stage selected`,
+      `[Automated] ${leads.length} of your leads have no lead stage selected`,
       consultantEmailHtml(g.name.split(" ")[0], leads)
     );
     if (ok) { console.log(`  sent ${g.name} (${leads.length} leads)`); sent++; } else skipped++;
@@ -289,6 +293,7 @@ function consultantEmailHtml(firstName, leads) {
          ${summary}
        </table>
        <p>Emails sent: ${sent} &middot; skipped: ${skipped}. Full lead list is in the Excel report on the workflow run.</p>
+       <p style="color:#a0b4c6;font-size:11px;">Sent automatically by the CRM compliance system.</p>
      </div>`);
   console.log(`\nDone. Consultant emails sent: ${sent}, skipped: ${skipped}.`);
 })().catch((e) => { console.error("FATAL:", e); process.exit(1); });
