@@ -133,17 +133,23 @@ function gmailTransport() {
   return mailer;
 }
 
-async function sendEmail(to, subject, html) {
+async function sendEmail(to, subject, html, attachFile) {
   try {
     if (CFG.SEND_VIA === "gmail") {
-      await gmailTransport().sendMail({ from: CFG.GMAIL_USER, to, subject, html });
+      const msg = { from: CFG.GMAIL_USER, to, subject, html };
+      if (attachFile && require("fs").existsSync(attachFile))
+        msg.attachments = [{ filename: attachFile, path: attachFile }];
+      await gmailTransport().sendMail(msg);
       return true;
     }
     if (!RESEND_KEY) { console.log(`  (no RESEND_KEY — would have emailed ${to})`); return false; }
+    const body = { from: CFG.FROM_EMAIL, to: [to], subject, html };
+    if (attachFile && require("fs").existsSync(attachFile))
+      body.attachments = [{ filename: attachFile, content: require("fs").readFileSync(attachFile).toString("base64") }];
     const res = await fetch("https://api.resend.com/emails", {
       method: "POST",
       headers: { Authorization: `Bearer ${RESEND_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ from: CFG.FROM_EMAIL, to: [to], subject, html }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) {
       const t = (await res.text()).slice(0, 200);
@@ -261,39 +267,63 @@ function consultantEmailHtml(firstName, leads) {
   XLSX.writeFile(wb, CFG.OUT_FILE);
   console.log(`\nWrote ${CFG.OUT_FILE} (download from the run's Artifacts section).`);
 
-  if (CFG.DRY_RUN) { console.log(`\nDRY RUN: no emails sent.`); return; }
-
-  // ---- email each consultant ----
-  console.log(`\nSending consultant emails...`);
-  let sent = 0, skipped = 0;
-  for (const g of groups) {
-    if (!g.email) { console.log(`  skip ${g.name}: no email in HubSpot`); skipped++; continue; }
-    const leads = g.leads.slice(0, CFG.MAX_PER_CONSULTANT);
-    const ok = await sendEmail(
-      g.email,
-      `[Automated] ${leads.length} of your leads have no lead stage selected`,
-      consultantEmailHtml(g.name.split(" ")[0], leads)
-    );
-    if (ok) { console.log(`  sent ${g.name} (${leads.length} leads)`); sent++; } else skipped++;
-    await sleep(600); // gentle on the email API
+  // ---- email each consultant (live runs only) ----
+  let sent = 0, skipped = 0, noEmail = 0;
+  if (CFG.DRY_RUN) {
+    console.log(`\nDRY RUN: no consultant emails sent. They WOULD have gone to:`);
+    for (const g of groups) console.log(`   ${g.email ? g.email : "NO EMAIL IN HUBSPOT"}  (${g.name}, ${Math.min(g.leads.length, CFG.MAX_PER_CONSULTANT)} leads)`);
+    noEmail = groups.filter((g) => !g.email).length;
+  } else {
+    console.log(`\nSending consultant emails...`);
+    for (const g of groups) {
+      if (!g.email) { console.log(`  skip ${g.name}: no email in HubSpot`); noEmail++; skipped++; continue; }
+      const leads = g.leads.slice(0, CFG.MAX_PER_CONSULTANT);
+      const ok = await sendEmail(g.email, `[Automated] ${leads.length} of your leads have no lead stage selected`,
+        consultantEmailHtml(g.name.split(" ")[0], leads));
+      if (ok) { console.log(`  sent ${g.name} (${leads.length} leads)`); sent++; } else skipped++;
+      await sleep(600);
+    }
   }
 
-  // ---- report to Ali ----
+  // ---- report to Ali: sent on EVERY run, including dry runs ----
   const summary = groups.map((g) =>
     `<tr><td style="padding:4px 10px;border-bottom:1px solid #eee;">${g.name}</td>
          <td style="padding:4px 10px;border-bottom:1px solid #eee;">${g.leads.length}</td>
-         <td style="padding:4px 10px;border-bottom:1px solid #eee;">${g.email || "NO EMAIL"}</td></tr>`).join("");
-  await sendEmail(CFG.ALI_EMAIL, `No lead stage report — ${contacts.length} leads across ${groups.length} consultants`,
-    `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#33475b;">
-       <p>Leads with no lead stage in the selected window.</p>
-       <table style="border-collapse:collapse;font-size:13px;">
-         <tr><th align="left" style="padding:4px 10px;border-bottom:2px solid #33475b;">Consultant</th>
-             <th align="left" style="padding:4px 10px;border-bottom:2px solid #33475b;">Leads</th>
-             <th align="left" style="padding:4px 10px;border-bottom:2px solid #33475b;">Email</th></tr>
-         ${summary}
-       </table>
-       <p>Emails sent: ${sent} &middot; skipped: ${skipped}. Full lead list is in the Excel report on the workflow run.</p>
-       <p style="color:#a0b4c6;font-size:11px;">Sent automatically by the CRM compliance system.</p>
-     </div>`);
-  console.log(`\nDone. Consultant emails sent: ${sent}, skipped: ${skipped}.`);
+         <td style="padding:4px 10px;border-bottom:1px solid #eee;">${g.email || '<span style="color:#c0392b;">NO EMAIL</span>'}</td></tr>`).join("");
+
+  const banner = CFG.DRY_RUN
+    ? `<p style="background:#fff4e5;border-left:3px solid #f5a623;padding:8px 12px;font-size:13px;color:#8a6d3b;">
+         <strong>DRY RUN / PREVIEW.</strong> No consultant received an email. This is what would be sent on a live run.
+       </p>`
+    : `<p style="background:#eaf6ec;border-left:3px solid #45a163;padding:8px 12px;font-size:13px;color:#2c6b40;">
+         <strong>LIVE RUN.</strong> Consultant emails have been sent.
+       </p>`;
+
+  const reportHtml = `
+    <div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#33475b;">
+      ${banner}
+      <p>Leads with <strong>no lead stage</strong> selected, owner known, in the window
+         ${oldest ? day(new Date(oldest).toISOString()) : "any time"} to ${day(new Date(newest).toISOString())}.</p>
+      <p><strong>${contacts.length}</strong> leads across <strong>${groups.length}</strong> consultants.</p>
+      <table style="border-collapse:collapse;font-size:13px;">
+        <tr><th align="left" style="padding:4px 10px;border-bottom:2px solid #33475b;">Consultant</th>
+            <th align="left" style="padding:4px 10px;border-bottom:2px solid #33475b;">Leads</th>
+            <th align="left" style="padding:4px 10px;border-bottom:2px solid #33475b;">Email</th></tr>
+        ${summary}
+      </table>
+      <p style="margin-top:14px;">${CFG.DRY_RUN
+        ? `Would email: ${groups.length - noEmail} consultants &middot; no email on file: ${noEmail}`
+        : `Emails sent: ${sent} &middot; skipped: ${skipped} (no email on file: ${noEmail})`}</p>
+      <p>The full per-lead list is attached as a spreadsheet.</p>
+      <p style="color:#a0b4c6;font-size:11px;">Sent automatically by the CRM compliance system.</p>
+    </div>`;
+
+  const okReport = await sendEmail(
+    CFG.ALI_EMAIL,
+    `${CFG.DRY_RUN ? "[PREVIEW] " : ""}No lead stage report — ${contacts.length} leads, ${groups.length} consultants`,
+    reportHtml,
+    CFG.OUT_FILE
+  );
+  console.log(`\nReport email to ${CFG.ALI_EMAIL}: ${okReport ? "SENT (with spreadsheet attached)" : "FAILED — see the error above"}`);
+  if (!CFG.DRY_RUN) console.log(`Consultant emails sent: ${sent}, skipped: ${skipped}.`);
 })().catch((e) => { console.error("FATAL:", e); process.exit(1); });
