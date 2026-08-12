@@ -1,0 +1,69 @@
+name: No Lead Stage Chaser
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (report only, sends no email)?"
+        required: true
+        type: choice
+        default: "true"
+        options: ["true", "false"]
+      window:
+        description: "Which leads to chase"
+        required: true
+        type: choice
+        default: "A week old (7 to 14 days)"
+        options:
+          - "A week old (7 to 14 days)"
+          - "Last 7 days (0 to 7 days)"
+          - "Two to four weeks (14 to 30 days)"
+          - "One to three months (30 to 90 days)"
+          - "EVERYTHING older than 7 days (very large)"
+      max_per_consultant:
+        description: "Most leads to email one consultant"
+        required: true
+        type: choice
+        default: "150"
+        options: ["25", "50", "100", "150", "300", "1000"]
+      from_email:
+        description: "Sender (use onboarding@resend.dev until hofmigration.com is verified in Resend)"
+        required: true
+        type: choice
+        default: "onboarding@resend.dev"
+        options: ["onboarding@resend.dev", "noreply@hofmigration.com"]
+
+jobs:
+  chase:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm install xlsx
+      - name: Work out the date window
+        id: win
+        run: |
+          case "${{ inputs.window }}" in
+            "A week old (7 to 14 days)")               echo "min=7"  >> $GITHUB_OUTPUT; echo "max=14" >> $GITHUB_OUTPUT ;;
+            "Last 7 days (0 to 7 days)")               echo "min=0"  >> $GITHUB_OUTPUT; echo "max=7"  >> $GITHUB_OUTPUT ;;
+            "Two to four weeks (14 to 30 days)")       echo "min=14" >> $GITHUB_OUTPUT; echo "max=30" >> $GITHUB_OUTPUT ;;
+            "One to three months (30 to 90 days)")     echo "min=30" >> $GITHUB_OUTPUT; echo "max=90" >> $GITHUB_OUTPUT ;;
+            *)                                         echo "min=7"  >> $GITHUB_OUTPUT; echo "max=0"  >> $GITHUB_OUTPUT ;;
+          esac
+      - run: node nostage-agent.js
+        env:
+          HUBSPOT_TOKEN: ${{ secrets.HUBSPOT_TOKEN }}
+          RESEND_KEY: ${{ secrets.RESEND_KEY }}
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+          MIN_AGE_DAYS: ${{ steps.win.outputs.min }}
+          MAX_AGE_DAYS: ${{ steps.win.outputs.max }}
+          MAX_PER_CONSULTANT: ${{ inputs.max_per_consultant }}
+          FROM_EMAIL: ${{ inputs.from_email }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: no-lead-stage-report
+          path: no-lead-stage-report.xlsx
