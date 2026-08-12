@@ -26,12 +26,15 @@ on:
         type: choice
         default: "150"
         options: ["25", "50", "100", "150", "300", "1000"]
-      from_email:
-        description: "Sender (use onboarding@resend.dev until hofmigration.com is verified in Resend)"
+      send_via:
+        description: "How to send"
         required: true
         type: choice
-        default: "onboarding@resend.dev"
-        options: ["onboarding@resend.dev", "noreply@hofmigration.com"]
+        default: "Gmail - from razaali@hofmigration.com"
+        options:
+          - "Gmail - from razaali@hofmigration.com"
+          - "Resend - noreply@hofmigration.com (needs verified domain)"
+          - "Resend - onboarding@resend.dev (test, reaches Ali only)"
 
 jobs:
   chase:
@@ -42,7 +45,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - run: npm install xlsx
+      - run: npm install xlsx nodemailer
       - name: Work out the date window
         id: win
         run: |
@@ -53,15 +56,26 @@ jobs:
             "One to three months (30 to 90 days)")     echo "min=30" >> $GITHUB_OUTPUT; echo "max=90" >> $GITHUB_OUTPUT ;;
             *)                                         echo "min=7"  >> $GITHUB_OUTPUT; echo "max=0"  >> $GITHUB_OUTPUT ;;
           esac
+      - name: Work out the sending method
+        id: send
+        run: |
+          case "${{ inputs.send_via }}" in
+            "Gmail"*)                                        echo "via=gmail"  >> $GITHUB_OUTPUT; echo "from=razaali@hofmigration.com" >> $GITHUB_OUTPUT ;;
+            "Resend - noreply@hofmigration.com"*)            echo "via=resend" >> $GITHUB_OUTPUT; echo "from=noreply@hofmigration.com" >> $GITHUB_OUTPUT ;;
+            *)                                               echo "via=resend" >> $GITHUB_OUTPUT; echo "from=onboarding@resend.dev"     >> $GITHUB_OUTPUT ;;
+          esac
       - run: node nostage-agent.js
         env:
           HUBSPOT_TOKEN: ${{ secrets.HUBSPOT_TOKEN }}
           RESEND_KEY: ${{ secrets.RESEND_KEY }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GMAIL_USER: razaali@hofmigration.com
           DRY_RUN_INPUT: ${{ inputs.dry_run }}
           MIN_AGE_DAYS: ${{ steps.win.outputs.min }}
           MAX_AGE_DAYS: ${{ steps.win.outputs.max }}
           MAX_PER_CONSULTANT: ${{ inputs.max_per_consultant }}
-          FROM_EMAIL: ${{ inputs.from_email }}
+          SEND_VIA: ${{ steps.send.outputs.via }}
+          FROM_EMAIL: ${{ steps.send.outputs.from }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
