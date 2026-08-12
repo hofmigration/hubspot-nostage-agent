@@ -60,20 +60,27 @@ async function hub(method, path, body) {
   throw new Error(`rate-limited: ${method} ${path}`);
 }
 
-// name + email for every owner in the portal
+// name + email for every owner — ACTIVE first, then ARCHIVED (deactivated) users.
+// Without the archived pass, deactivated owners show up as a bare id with no email,
+// which hides the fact that their leads are orphaned.
 async function owners() {
-  const map = {}; let after;
-  for (let i = 0; i < 30; i++) {
-    const d = await hub("GET", `/crm/v3/owners/?limit=100${after ? `&after=${after}` : ""}`);
-    for (const o of d.results || []) {
-      map[String(o.id)] = {
-        name: [o.firstName, o.lastName].filter(Boolean).join(" ").trim() || o.email || String(o.id),
-        email: o.email || null,
-        active: o.archived !== true,
-      };
+  const map = {};
+  for (const archived of [false, true]) {
+    let after;
+    for (let i = 0; i < 30; i++) {
+      const d = await hub("GET", `/crm/v3/owners/?limit=100&archived=${archived}${after ? `&after=${after}` : ""}`);
+      for (const o of d.results || []) {
+        const id = String(o.id);
+        if (map[id]) continue;                       // active record wins
+        map[id] = {
+          name: [o.firstName, o.lastName].filter(Boolean).join(" ").trim() || o.email || id,
+          email: o.email || null,
+          active: !archived,
+        };
+      }
+      after = d.paging?.next?.after;
+      if (!after) break;
     }
-    after = d.paging?.next?.after;
-    if (!after) break;
   }
   return map;
 }
@@ -303,31 +310,38 @@ function consultantEmailHtml(firstName, leads, windowLabel) {
   for (const g of groups)
     for (const l of g.leads)
       allRows.push({
-        Consultant: g.name, "Consultant Email": g.email || "", Lead: l.name,
+        Consultant: g.name, "Consultant Email": g.email || "",
+        "Owner Status": g.active ? "Active" : "DEACTIVATED - reassign", Lead: l.name,
         Phone: l.phone, "Lead Email": l.email, "Create Date": l.created,
         "Latest Source": l.source, "Latest Source Date": l.sourceDate, Link: link(l.id),
       });
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
-    groups.map((g) => ({ Consultant: g.name, Email: g.email || "NO EMAIL", "Leads with no lead stage": g.leads.length }))
+    groups.map((g) => ({ Consultant: g.name, Email: g.email || "NO EMAIL", "Owner Status": g.active ? "Active" : "DEACTIVATED - reassign", "Leads with no lead stage": g.leads.length }))
   ), "Per Consultant");
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(allRows), "All Leads");
   XLSX.writeFile(wb, CFG.OUT_FILE);
   console.log(`\nWrote ${CFG.OUT_FILE} (download from the run's Artifacts section).`);
 
   // ---- email each consultant (live runs only) ----
-  let sent = 0, skipped = 0, noEmail = 0;
+  let sent = 0, skipped = 0, noEmail = 0, orphaned = 0;
   if (CFG.DRY_RUN) {
     console.log(`\nDRY RUN: no consultant emails sent. They WOULD have gone to:`);
-    for (const g of groups) console.log(`   ${g.email ? g.email : "NO EMAIL IN HUBSPOT"}  (${g.name}, ${Math.min(g.leads.length, CFG.MAX_PER_CONSULTANT)} leads)`);
-    noEmail = groups.filter((g) => !g.email).length;
+    for (const g of groups) {
+      const tag = !g.active ? "DEACTIVATED USER — reassign these leads" : (g.email || "NO EMAIL IN HUBSPOT");
+      console.log(`   ${tag}  (${g.name}, ${Math.min(g.leads.length, CFG.MAX_PER_CONSULTANT)} leads)`);
+    }
+    orphaned = groups.filter((g) => !g.active).length;
+    noEmail = groups.filter((g) => g.active && !g.email).length;
   } else if (!transport.ok) {
     console.log(`\nSKIPPING consultant emails — email is not working (${transport.reason}).`);
     skipped = groups.length;
-    noEmail = groups.filter((g) => !g.email).length;
+    orphaned = groups.filter((g) => !g.active).length;
+    noEmail = groups.filter((g) => g.active && !g.email).length;
   } else {
     console.log(`\nSending consultant emails...`);
     for (const g of groups) {
+      if (!g.active) { console.log(`  skip ${g.name}: user is DEACTIVATED — these leads need reassigning`); orphaned++; skipped++; continue; }
       if (!g.email) { console.log(`  skip ${g.name}: no email in HubSpot`); noEmail++; skipped++; continue; }
       const leads = g.leads.slice(0, CFG.MAX_PER_CONSULTANT);
       const ok = await sendEmail(g.email, `[Automated] ${leads.length} of your leads have no lead stage selected`,
@@ -341,8 +355,11 @@ function consultantEmailHtml(firstName, leads, windowLabel) {
   const reportRows = groups.map((g) => [
     T.esc(g.name),
     `<strong>${g.leads.length}</strong>`,
-    g.email ? T.link(`mailto:${g.email}`, g.email) : `<span style="color:#c0392b;">NO EMAIL</span>`,
+    !g.active
+      ? `<span style="color:#c0392b;">DEACTIVATED &mdash; reassign</span>`
+      : (g.email ? T.link(`mailto:${g.email}`, g.email) : `<span style="color:#c0392b;">NO EMAIL</span>`),
   ]);
+  const orphanLeads = groups.filter((g) => !g.active).reduce((n, g) => n + g.leads.length, 0);
 
   const reportHtml = T.shell({
     title: "HOF No Lead Stage Report",
@@ -352,11 +369,14 @@ function consultantEmailHtml(firstName, leads, windowLabel) {
         ? T.callout("<strong>DRY RUN / PREVIEW.</strong> No consultant received an email. This is what would be sent on a live run.", "warn")
         : T.callout("<strong>LIVE RUN.</strong> Consultant emails have been sent.", "ok")) +
       T.paragraph(`Contacts with <strong>no lead stage</strong> selected and a known owner, where the create date or latest traffic source date falls in this window.`) +
+      (orphanLeads > 0
+        ? T.callout(`<strong>${orphanLeads} lead(s)</strong> are owned by <strong>${groups.filter((g) => !g.active).length} deactivated user(s)</strong>. Nobody active will work these. They need reassigning.`, "alert")
+        : "") +
       T.sectionTitle(`Leads per consultant — ${groups.length} consultant(s)`) +
       T.table(["Consultant", "Leads", "Email"], reportRows) +
       T.paragraph(CFG.DRY_RUN
-        ? `Would email <strong>${groups.length - noEmail}</strong> consultants &middot; no email on file: <strong>${noEmail}</strong>`
-        : `Emails sent: <strong>${sent}</strong> &middot; skipped: <strong>${skipped}</strong> &middot; no email on file: <strong>${noEmail}</strong>`, 13) +
+        ? `Would email <strong>${groups.length - noEmail - orphaned}</strong> consultants &middot; no email on file: <strong>${noEmail}</strong> &middot; deactivated: <strong>${orphaned}</strong>`
+        : `Emails sent: <strong>${sent}</strong> &middot; skipped: <strong>${skipped}</strong> &middot; no email on file: <strong>${noEmail}</strong> &middot; deactivated: <strong>${orphaned}</strong>`, 13) +
       T.paragraph("The full per-lead list is attached as a spreadsheet.", 13) +
       T.footer(`Generated ${new Date().toISOString().slice(0, 10)}.`),
   });
