@@ -28,9 +28,16 @@ const CFG = {
   MAX_PER_CONSULTANT: parseInt(process.env.MAX_PER_CONSULTANT || "150", 10),
 
   ALI_EMAIL: "razaali@hofmigration.com",
-  // onboarding@resend.dev can ONLY reach Ali. Verify hofmigration.com in Resend,
-  // then set this to noreply@hofmigration.com to reach the consultants.
-  FROM_EMAIL: process.env.FROM_EMAIL || "onboarding@resend.dev",
+
+  // HOW EMAIL IS SENT:
+  //  "gmail"  = sent from Ali's own Gmail (razaali@hofmigration.com). Works today,
+  //             no DNS setup. Lands in Ali's Sent folder, replies come back to Ali.
+  //             Needs the GMAIL_APP_PASSWORD secret.
+  //  "resend" = Resend API. Consultant emails only work AFTER hofmigration.com is
+  //             verified in Resend; until then only Ali's own address can receive.
+  SEND_VIA: (process.env.SEND_VIA || "gmail").toLowerCase(),
+  GMAIL_USER: process.env.GMAIL_USER || "razaali@hofmigration.com",
+  FROM_EMAIL: process.env.FROM_EMAIL || "onboarding@resend.dev",   // resend mode only
   PORTAL_ID: "23735726",
   OUT_FILE: "no-lead-stage-report.xlsx",
 };
@@ -112,15 +119,43 @@ async function fetchUnstaged() {
 const link = (id) => `https://app.hubspot.com/contacts/${CFG.PORTAL_ID}/record/0-1/${id}`;
 const day = (iso) => (iso ? String(iso).slice(0, 10) : "");
 
-async function sendEmail(to, subject, html) {
-  if (!RESEND_KEY) { console.log(`  (no RESEND_KEY — would have emailed ${to})`); return false; }
-  const res = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${RESEND_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ from: CFG.FROM_EMAIL, to: [to], subject, html }),
+// ---- sending ----------------------------------------------------------------
+let mailer = null;
+function gmailTransport() {
+  if (mailer) return mailer;
+  const pass = process.env.GMAIL_APP_PASSWORD;
+  if (!pass) throw new Error("Missing GMAIL_APP_PASSWORD secret (16-character Google app password, no spaces)");
+  const nodemailer = require("nodemailer");
+  mailer = nodemailer.createTransport({
+    host: "smtp.gmail.com", port: 465, secure: true,
+    auth: { user: CFG.GMAIL_USER, pass },
   });
-  if (!res.ok) { console.log(`  ! email to ${to} failed: ${res.status} ${(await res.text()).slice(0, 150)}`); return false; }
-  return true;
+  return mailer;
+}
+
+async function sendEmail(to, subject, html) {
+  try {
+    if (CFG.SEND_VIA === "gmail") {
+      await gmailTransport().sendMail({ from: CFG.GMAIL_USER, to, subject, html });
+      return true;
+    }
+    if (!RESEND_KEY) { console.log(`  (no RESEND_KEY — would have emailed ${to})`); return false; }
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${RESEND_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ from: CFG.FROM_EMAIL, to: [to], subject, html }),
+    });
+    if (!res.ok) {
+      const t = (await res.text()).slice(0, 200);
+      console.log(`  ! email to ${to} failed: ${res.status} ${t}`);
+      if (res.status === 403) console.log(`    (Resend only sends to your own address until hofmigration.com is verified — switch the sender dropdown to Gmail)`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.log(`  ! email to ${to} failed: ${e.message}`);
+    return false;
+  }
 }
 
 function consultantEmailHtml(firstName, leads) {
@@ -145,6 +180,7 @@ function consultantEmailHtml(firstName, leads) {
     </table>
     <p style="margin-top:16px;">Total: <strong>${leads.length}</strong> leads.</p>
     <p>Thank you.</p>
+    <p style="color:#7c98b6;font-size:12px;">Ali Raza &middot; Compliance &middot; HOF Migration</p>
   </div>`;
 }
 
@@ -154,7 +190,13 @@ function consultantEmailHtml(firstName, leads) {
   console.log(`=== No Lead Stage agent — ${new Date().toISOString()} ===`);
   console.log(`DRY_RUN: ${CFG.DRY_RUN}`);
   console.log(`Window:  created / last source between ${oldest ? day(new Date(oldest).toISOString()) : "any time"} and ${day(new Date(newest).toISOString())}`);
-  console.log(`Cap:     ${CFG.MAX_PER_CONSULTANT} leads per consultant\n`);
+  console.log(`Cap:     ${CFG.MAX_PER_CONSULTANT} leads per consultant`);
+  console.log(`Sending: ${CFG.SEND_VIA === "gmail" ? `Gmail as ${CFG.GMAIL_USER}` : `Resend as ${CFG.FROM_EMAIL}`}`);
+  if (!CFG.DRY_RUN && CFG.SEND_VIA === "gmail" && !process.env.GMAIL_APP_PASSWORD)
+    console.log(`!! GMAIL_APP_PASSWORD secret is missing — no email can be sent.`);
+  if (!CFG.DRY_RUN && CFG.SEND_VIA === "resend" && CFG.FROM_EMAIL.endsWith("resend.dev"))
+    console.log(`!! Sender is onboarding@resend.dev — consultants will NOT receive anything (403). Use Gmail instead.`);
+  console.log("");
 
   const ownerMap = await owners();
   const contacts = await fetchUnstaged();
