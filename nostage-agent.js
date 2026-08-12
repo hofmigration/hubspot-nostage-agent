@@ -10,6 +10,7 @@
 // Secrets: HUBSPOT_TOKEN, RESEND_KEY.
 
 const XLSX = require("xlsx");
+const T = require("./email-template");
 
 const HUBSPOT_TOKEN = process.env.HUBSPOT_TOKEN;
 const RESEND_KEY = process.env.RESEND_KEY;
@@ -164,34 +165,30 @@ async function sendEmail(to, subject, html, attachFile) {
   }
 }
 
-function consultantEmailHtml(firstName, leads) {
-  const rows = leads.map((l) => `
-    <tr>
-      <td style="padding:6px 10px;border-bottom:1px solid #eee;"><a href="${link(l.id)}">${l.name}</a></td>
-      <td style="padding:6px 10px;border-bottom:1px solid #eee;">${l.phone || ""}</td>
-      <td style="padding:6px 10px;border-bottom:1px solid #eee;">${l.created}</td>
-    </tr>`).join("");
-  return `
-  <div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#33475b;">
-    <p style="background:#f5f8fa;border-left:3px solid #7c98b6;padding:8px 12px;margin:0 0 16px 0;font-size:13px;color:#516f90;">
-      This is an automated compliance email. Please do not reply to this message. For any question, contact Ali Raza directly.
-    </p>
-    <p>Hi ${firstName},</p>
-    <p>Hope you are well. The leads below are assigned to you and still have <strong>no lead stage</strong> selected.</p>
-    <p>Kindly contact these clients and select the correct lead stage on each record.</p>
-    <table style="border-collapse:collapse;font-size:13px;">
-      <tr>
-        <th align="left" style="padding:6px 10px;border-bottom:2px solid #33475b;">Lead</th>
-        <th align="left" style="padding:6px 10px;border-bottom:2px solid #33475b;">Phone</th>
-        <th align="left" style="padding:6px 10px;border-bottom:2px solid #33475b;">Created</th>
-      </tr>
-      ${rows}
-    </table>
-    <p style="margin-top:16px;">Total: <strong>${leads.length}</strong> leads.</p>
-    <p>Thank you.</p>
-    <p style="color:#7c98b6;font-size:12px;margin-bottom:2px;">Ali Raza &middot; Compliance &middot; HOF Migration</p>
-    <p style="color:#a0b4c6;font-size:11px;margin-top:0;">Sent automatically by the CRM compliance system. Generated ${new Date().toISOString().slice(0, 10)}.</p>
-  </div>`;
+function consultantEmailHtml(firstName, leads, windowLabel) {
+  const rows = leads.map((l, i) => T.row({
+    name: l.name,
+    title: "",
+    link: link(l.id),
+    linkLabel: "Contact",
+    details: [
+      `created ${T.esc(l.created)}${l.phone ? ` &middot; ${T.esc(l.phone)}` : ""}${l.source ? ` &middot; source: ${T.esc(l.source)}` : ""}`,
+    ],
+    last: i === leads.length - 1,
+  })).join("");
+
+  return T.shell({
+    title: "Leads Missing Lead Stage",
+    subtitle: `${windowLabel} &middot; ${leads.length} lead${leads.length === 1 ? "" : "s"} assigned to you`,
+    body:
+      T.callout("This is an <strong>automated</strong> compliance email. Please do not reply to this message. For any question, contact Ali Raza directly.", "info") +
+      T.paragraph(`Hi ${T.esc(firstName)}, hope you are well.`) +
+      T.paragraph("The leads below are assigned to you and still have <strong>no lead stage</strong> selected. Kindly contact these clients and select the correct lead stage on each record.") +
+      T.sectionTitle(`Your unstaged leads — ${leads.length} lead${leads.length === 1 ? "" : "s"}`) +
+      rows +
+      T.paragraph(`<strong>Total: ${leads.length}</strong>`, 13) +
+      T.footer(),
+  });
 }
 
 (async () => {
@@ -211,6 +208,7 @@ function consultantEmailHtml(firstName, leads) {
   const ownerMap = await owners();
   const contacts = await fetchUnstaged();
   console.log(`Contacts with NO lead stage and a known owner in this window: ${contacts.length}`);
+  const windowLabel = `${oldest ? day(new Date(oldest).toISOString()) : "any time"} \u2192 ${day(new Date(newest).toISOString())}`;
 
   // group by consultant
   const byOwner = {};
@@ -279,44 +277,35 @@ function consultantEmailHtml(firstName, leads) {
       if (!g.email) { console.log(`  skip ${g.name}: no email in HubSpot`); noEmail++; skipped++; continue; }
       const leads = g.leads.slice(0, CFG.MAX_PER_CONSULTANT);
       const ok = await sendEmail(g.email, `[Automated] ${leads.length} of your leads have no lead stage selected`,
-        consultantEmailHtml(g.name.split(" ")[0], leads));
+        consultantEmailHtml(g.name.split(" ")[0], leads, windowLabel));
       if (ok) { console.log(`  sent ${g.name} (${leads.length} leads)`); sent++; } else skipped++;
       await sleep(600);
     }
   }
 
   // ---- report to Ali: sent on EVERY run, including dry runs ----
-  const summary = groups.map((g) =>
-    `<tr><td style="padding:4px 10px;border-bottom:1px solid #eee;">${g.name}</td>
-         <td style="padding:4px 10px;border-bottom:1px solid #eee;">${g.leads.length}</td>
-         <td style="padding:4px 10px;border-bottom:1px solid #eee;">${g.email || '<span style="color:#c0392b;">NO EMAIL</span>'}</td></tr>`).join("");
+  const reportRows = groups.map((g) => [
+    T.esc(g.name),
+    `<strong>${g.leads.length}</strong>`,
+    g.email ? T.link(`mailto:${g.email}`, g.email) : `<span style="color:#c0392b;">NO EMAIL</span>`,
+  ]);
 
-  const banner = CFG.DRY_RUN
-    ? `<p style="background:#fff4e5;border-left:3px solid #f5a623;padding:8px 12px;font-size:13px;color:#8a6d3b;">
-         <strong>DRY RUN / PREVIEW.</strong> No consultant received an email. This is what would be sent on a live run.
-       </p>`
-    : `<p style="background:#eaf6ec;border-left:3px solid #45a163;padding:8px 12px;font-size:13px;color:#2c6b40;">
-         <strong>LIVE RUN.</strong> Consultant emails have been sent.
-       </p>`;
-
-  const reportHtml = `
-    <div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#33475b;">
-      ${banner}
-      <p>Leads with <strong>no lead stage</strong> selected, owner known, in the window
-         ${oldest ? day(new Date(oldest).toISOString()) : "any time"} to ${day(new Date(newest).toISOString())}.</p>
-      <p><strong>${contacts.length}</strong> leads across <strong>${groups.length}</strong> consultants.</p>
-      <table style="border-collapse:collapse;font-size:13px;">
-        <tr><th align="left" style="padding:4px 10px;border-bottom:2px solid #33475b;">Consultant</th>
-            <th align="left" style="padding:4px 10px;border-bottom:2px solid #33475b;">Leads</th>
-            <th align="left" style="padding:4px 10px;border-bottom:2px solid #33475b;">Email</th></tr>
-        ${summary}
-      </table>
-      <p style="margin-top:14px;">${CFG.DRY_RUN
-        ? `Would email: ${groups.length - noEmail} consultants &middot; no email on file: ${noEmail}`
-        : `Emails sent: ${sent} &middot; skipped: ${skipped} (no email on file: ${noEmail})`}</p>
-      <p>The full per-lead list is attached as a spreadsheet.</p>
-      <p style="color:#a0b4c6;font-size:11px;">Sent automatically by the CRM compliance system.</p>
-    </div>`;
+  const reportHtml = T.shell({
+    title: "HOF No Lead Stage Report",
+    subtitle: `${windowLabel} &middot; ${contacts.length} leads &middot; ${groups.length} consultants`,
+    body:
+      (CFG.DRY_RUN
+        ? T.callout("<strong>DRY RUN / PREVIEW.</strong> No consultant received an email. This is what would be sent on a live run.", "warn")
+        : T.callout("<strong>LIVE RUN.</strong> Consultant emails have been sent.", "ok")) +
+      T.paragraph(`Contacts with <strong>no lead stage</strong> selected and a known owner, where the create date or latest traffic source date falls in this window.`) +
+      T.sectionTitle(`Leads per consultant — ${groups.length} consultant(s)`) +
+      T.table(["Consultant", "Leads", "Email"], reportRows) +
+      T.paragraph(CFG.DRY_RUN
+        ? `Would email <strong>${groups.length - noEmail}</strong> consultants &middot; no email on file: <strong>${noEmail}</strong>`
+        : `Emails sent: <strong>${sent}</strong> &middot; skipped: <strong>${skipped}</strong> &middot; no email on file: <strong>${noEmail}</strong>`, 13) +
+      T.paragraph("The full per-lead list is attached as a spreadsheet.", 13) +
+      T.footer(`Generated ${new Date().toISOString().slice(0, 10)}.`),
+  });
 
   const okReport = await sendEmail(
     CFG.ALI_EMAIL,
